@@ -1,211 +1,333 @@
-
 #include <stdio.h>
 #include <string.h>
 
-#include <pico/stdlib.h>
-
+#include <pico/stdlib.h>      // Picon perusjutut (printf, sleep_ms, gpio...)
 #include <FreeRTOS.h>
 #include <queue.h>
 #include <task.h>
 
-#include "tkjhat/sdk.h"
+#include "hardware/i2c.h"     // I2C-väylä
+#include "tkjhat/sdk.h"       // JTKJ Hat -SDK
+#include <inttypes.h>         // uint8_t jne.
 
-// Exercise 4. Include the libraries necessaries to use the usb-serial-debug, and tinyusb
-// Tehtävä 4 . Lisää usb-serial-debugin ja tinyusbin käyttämiseen tarvittavat kirjastot.
+// ===============================
+// MÄÄRITYKSET / DEFINET
+// ===============================
+
+// FreeRTOS-tehtävien pinon koko
+#define DEFAULT_STACK_SIZE 2048 
+
+// Morse-puskurin koko (kuinka pitkä viesti voi olla)
+#define MORSE_BUFFER_SIZE 256 // Tätä kokoa voi vaihtaa. Tää saa nyt alkuun riittää.
+
+// I2C-asetukset (MUUTA PINNIT OIKEIKSI)
+#define I2C_PORT    i2c0
+#define I2C_SDA_PIN X    // vaihda oikeiksi arvoiksi (esim. 4)
+#define I2C_SCL_PIN Y    // vaihda oikeiksi arvoiksi (esim. 5)
+
+// IMU = gyroskooppi / liikeanturi (ICM-42670)
+#define ICM42670_ADDR 0x69
+#define REG_VIESTI      0x75   // WHO_AM_I -rekisteri (voi myöhemmin nimetä uudelleen)
+#define REG_PWR_MGMT0   0x1F   // tehohallinta (gyro+accel päälle)
+
+// Nappulat (vaihda pinnit oikeiksi)
+#define BUTTON1     A          // nappi 1: kirjaa piste/viiva
+#define BUTTON2     B          // nappi 2: välilyönnit
+
+// ===============================
+// TILAKONE
+// ===============================
+
+// Ohjelman eri tilat. Voidaan käyttää kun viestiä rakennetaan ja tulostetaan.
+enum state {
+    STATE_INIT = 0,      // aloitus / nollaus
+    STATE_READ_INPUT,    // luetaan imu + napit
+    STATE_CONVERT,       // (jos joskus erotetaan muunnos omaksi vaiheeksi)
+    STATE_PRINT          // tulostetaan valmis morse-viesti
+};
+
+enum state programState = STATE_INIT; // aloitetaan INIT-tilasta
+
+// ===============================
+// GLOBAALIT MUUTTUJAT
+// ===============================
+
+// Tänne tallennetaan morse-viesti merkkijonona, esim: ".- .- ...  \n"
+char morseBuffer[MORSE_BUFFER_SIZE];
+
+// morseIndex kertoo, mihin kohtaan puskurissa kirjoitetaan seuraava merkki
+int morseIndex = 0; 
+
+// spaceCount laskee peräkkäiset välilyönnit (BUTTON2 painallukset):
+// 1 väli  = kirjainväli
+// 2 väliä = sanaväli
+// 3 väliä = viestin loppu
+int spaceCount = 0;
+
+// Napin edellinen tila, jotta voidaan tunnistaa "uusi painallus"
+int prevButton1 = 1; // 1 = ei painettuna (pull-up)
+int prevButton2 = 1;
+
+// ===============================
+// PROTOTYYPIT
+// ===============================
+
+// IMU-apufunktiot
+void imu_write_reg(uint8_t reg, uint8_t value);
+uint8_t imu_read_reg(uint8_t reg);
+void imu_init(void);
+
+// Kulman luku ja muunto piste/viiva-symboliksi (tulee tehtäväksi myöhemmin)
+int read_angle_degrees(void);
+char angle_to_symbol(int angle);
+
+// FreeRTOS-tehtävät
+static void sensor_task(void *arg);
+static void print_task(void *arg);
 
 
+// ===============================
+// IMU-APUFUNKTIOT
+// ===============================
 
-#define DEFAULT_STACK_SIZE 2048
-#define CDC_ITF_TX      1
+// Kirjoita yksi rekisteri IMU:lle I2C:n yli.
+// reg   = rekisterin osoite
+// value = kirjoitettava arvo
+void imu_write_reg(uint8_t reg, uint8_t value) {
+    uint8_t buf[2];
+    buf[0] = reg;     // rekisterin osoite
+    buf[1] = value;   // itse arvo
 
-
-// Tehtävä 3: Tilakoneen esittely Add missing states.
-// Exercise 3: Definition of the state machine. Add missing states.
-enum state { WAITING=1};
-enum state programState = WAITING;
-
-// Tehtävä 3: Valoisuuden globaali muuttuja
-// Exercise 3: Global variable for ambient light
-uint32_t ambientLight;
-
-static void btn_fxn(uint gpio, uint32_t eventMask) {
-    // Tehtävä 1: Vaihda LEDin tila.
-    //            Tarkista SDK, ja jos et löydä vastaavaa funktiota, sinun täytyy toteuttaa se itse.
-    // Exercise 1: Toggle the LED. 
-    //             Check the SDK and if you do not find a function you would need to implement it yourself. 
+    i2c_write_blocking(I2C_PORT, ICM42670_ADDR, buf, 2, false);
 }
 
+// Lue yksi rekisteri IMU:lta I2C:n yli.
+// reg = rekisterin osoite
+// palauttaa rekisteristä luetun arvon
+uint8_t imu_read_reg(uint8_t reg) {
+    uint8_t value = 0;
+
+    // ensin kerrotaan mille rekisterille halutaan luku
+    i2c_write_blocking(I2C_PORT, ICM42670_ADDR, &reg, 1, true);
+    // sitten luetaan 1 tavu kyseisestä rekisteristä
+    i2c_read_blocking(I2C_PORT, ICM42670_ADDR, &value, 1, false);
+
+    return value;
+}
+
+// Kytketään anturi päälle.
+// Tässä asetetaan gyro + accel low noise -tilaan, jotta mittaus on tarkempi.
+void imu_init(void) {
+    sleep_ms(10); // pieni odotus, että anturi ehtii herätä
+
+    // PWR_MGMT0 = 0x0F -> gyro ja accel päälle low-noise -tilassa.
+    imu_write_reg(REG_PWR_MGMT0, 0x0F);
+}
+
+// ===============================
+// KULMAFUNKTIOIDEN RUNGOT
+// ===============================
+
+// Tämä funktio tulee myöhemmin lukemaan kulman oikeasti IMU:sta.
+// Nyt se voi vaikka palauttaa aina saman arvon testimielessä.
+int read_angle_degrees(void) {
+    int angle = 0;
+
+    // TODO: lue kulma IMU:lta (0-90 astetta tms.)
+    // angle = ...
+
+    return angle;
+}
+
+// Muunnetaan kulma morse-symboliksi.
+// 0-45 astetta  = '-'
+// 45-90 astetta = '.'
+char angle_to_symbol(int angle) {
+    if (angle >= 0 && angle < 45) {
+        return '-'; // vaaka
+    } else {
+        return '.'; // pysty
+    }
+}
+
+// ===============================
+// FreeRTOS-TEHTÄVÄT
+// ===============================
+
+// sensor_task:
+// Tänne tulee Veikan koodi, joka
+// - lukee IMU:n kulman
+// - lukee nappi 1 ja 2 tilan
+// - nappi 1 painettaessa: lisää kulman mukaan '.' tai '-' morseBufferiin
+// - nappi 2 painettaessa: lisää välilyönnin ja kasvattaa spaceCountia
+// - kun spaceCount == 3 -> viesti valmis -> programState = STATE_PRINT
 static void sensor_task(void *arg){
     (void)arg;
-    // Tehtävä 2: Alusta valoisuusanturi. Etsi SDK-dokumentaatiosta sopiva funktio.
-    // Exercise 2: Init the light sensor. Find in the SDK documentation the adequate function.
-   
+
     for(;;){
-        
-        // Tehtävä 2: Muokkaa tästä eteenpäin sovelluskoodilla. Kommentoi seuraava rivi.
-        //             
-        // Exercise 2: Modify with application code here. Comment following line.
-        //             Read sensor data and print it out as string; 
-        tight_loop_contents(); 
+        // Nappien tämänhetkiset tilat: 1 = ei painettu, 0 = painettu
+        int currentButton1 = gpio_get(BUTTON1);
+        int currentButton2 = gpio_get(BUTTON2);
 
+        // Luetaan kulma anturilta (myöhemmin oikea imu-luku)
+        int angle = read_angle_degrees();
 
-   
+        // NAPPI 1: uusi painallus -> kirjaa piste/viiva
+        if (prevButton1 == 1 && currentButton1 == 0) {
+            char symbol = angle_to_symbol(angle);
 
+            if (morseIndex < MORSE_BUFFER_SIZE - 1) {
+                morseBuffer[morseIndex] = symbol;
+                morseIndex++;
+                spaceCount = 0; // merkki katkaisee välilyöntijonon
+            }
+        }
 
-        // Tehtävä 3:  Muokkaa aiemmin Tehtävässä 2 tehtyä koodia ylempänä.
-        //             Jos olet oikeassa tilassa, tallenna anturin arvo tulostamisen sijaan
-        //             globaaliin muuttujaan.
-        //             Sen jälkeen muuta tilaa.
-        // Exercise 3: Modify previous code done for Exercise 2, in previous lines. 
-        //             If you are in adequate state, instead of printing save the sensor value 
-        //             into the global variable.
-        //             After that, modify state
+        // NAPPI 2: uusi painallus -> lisää välilyönti
+        if (prevButton2 == 1 && currentButton2 == 0) {
+            if (morseIndex < MORSE_BUFFER_SIZE - 1) {
+                morseBuffer[morseIndex] = ' ';
+                morseIndex++;
+            }
 
+            spaceCount++;
 
+            // kolme välilyöntiä peräkkäin -> päätetään viesti
+            if (spaceCount == 3) {
+                // muutetaan viimeinen lisätty merkki rivinvaihdoksi
+                // jotta viesti päättyy "  \n"
+                if (morseIndex > 0) {
+                    morseBuffer[morseIndex - 1] = '\n';
+                }
 
+                // lisätään merkkijonon loppumerkki
+                if (morseIndex < MORSE_BUFFER_SIZE) {
+                    morseBuffer[morseIndex] = '\0';
+                }
 
+                // ilmoitetaan print_taskille, että viesti on valmis
+                programState = STATE_PRINT;
 
-        
-        // Exercise 2. Just for sanity check. Please, comment this out
-        // Tehtävä 2: Just for sanity check. Please, comment this out
-        printf("sensorTask\n");
+                // seuraavaa viestiä varten
+                spaceCount = 0;
+            }
+        }
 
-        // Do not remove this
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        // talletetaan nappien tila seuraavaa kierrosta varten
+        prevButton1 = currentButton1;
+        prevButton2 = currentButton2;
+
+        vTaskDelay(pdMS_TO_TICKS(20)); // pieni viive, ettei pyöri liian nopeasti
     }
 }
 
+// print_task:
+// Tänne tulee Oonan koodi, joka
+// - odottaa kunnes programState == STATE_PRINT
+// - tulostaa morseBufferin USB:lle (printf)
+// - tyhjentää puskurin ja asettaa tilan STATE_INIT / STATE_READ_INPUT
 static void print_task(void *arg){
     (void)arg;
-    
+
     while(1){
-        
-        // Tehtävä 3: Kun tila on oikea, tulosta sensoridata merkkijonossa debug-ikkunaan
-        //            Muista tilamuutos
-        //            Älä unohda kommentoida seuraavaa koodiriviä.
-        // Exercise 3: Print out sensor data as string to debug window if the state is correct
-        //             Remember to modify state
-        //             Do not forget to comment next line of code.
-        tight_loop_contents();
-        
+        if (programState == STATE_PRINT) {
+            // Tulostetaan morse-viesti
+            printf("%s", morseBuffer);
 
+            // Tyhjennetään puskuri seuraavaa viestiä varten
+            morseIndex = 0;
+            morseBuffer[0] = '\0';
 
-        
-        // Exercise 4. Use the usb_serial_print() instead of printf or similar in the previous line.
-        //             Check the rest of the code that you do not have printf (substitute them by usb_serial_print())
-        //             Use the TinyUSB library to send data through the other serial port (CDC 1).
-        //             You can use the functions at https://github.com/hathach/tinyusb/blob/master/src/class/cdc/cdc_device.h
-        //             You can find an example at hello_dual_cdc
-        //             The data written using this should be provided using csv
-        //             timestamp, luminance
-        // Tehtävä 4. Käytä usb_serial_print()-funktiota printf:n tai vastaavien sijaan edellisellä rivillä.
-        //            Tarkista myös muu koodi ja varmista, ettei siinä ole printf-kutsuja
-        //            (korvaa ne usb_serial_print()-funktiolla).
-        //            Käytä TinyUSB-kirjastoa datan lähettämiseen toisen sarjaportin (CDC 1) kautta.
-        //            Voit käyttää funktioita: https://github.com/hathach/tinyusb/blob/master/src/class/cdc/cdc_device.h
-        //            Esimerkki löytyy hello_dual_cdc-projektista.
-        //            Tällä menetelmällä kirjoitettu data tulee antaa CSV-muodossa:
-        //            timestamp, luminance
+            // Palataan alku-/luku-tilaan
+            programState = STATE_READ_INPUT;
+        }
 
-
-
-
-        // Exercise 3. Just for sanity check. Please, comment this out
-        // Tehtävä 3: Just for sanity check. Please, comment this out
-        printf("printTask\n");
-        
-        // Do not remove this
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(50)); // ei tarvitse tarkistaa koko ajan
     }
 }
 
-
-// Exercise 4: Uncomment the following line to activate the TinyUSB library.  
-// Tehtävä 4:  Poista seuraavan rivin kommentointi aktivoidaksesi TinyUSB-kirjaston. 
-
-/*
-static void usbTask(void *arg) {
-    (void)arg;
-    while (1) {
-        tud_task();              // With FreeRTOS wait for events
-                                 // Do not add vTaskDelay. 
-    }
-}*/
+// ===============================
+// PÄÄOHJELMA (main)
+// ===============================
 
 int main() {
-
-    // Exercise 4: Comment the statement stdio_init_all(); 
-    //             Instead, add AT THE END OF MAIN (before vTaskStartScheduler();) adequate statements to enable the TinyUSB library and the usb-serial-debug.
-    //             You can see hello_dual_cdc for help
-    //             In CMakeLists.txt add the cfg-dual-usbcdc
-    //             In CMakeLists.txt deactivate pico_enable_stdio_usb
-    // Tehtävä 4:  Kommentoi lause stdio_init_all();
-    //             Sen sijaan lisää MAIN LOPPUUN (ennen vTaskStartScheduler();) tarvittavat komennot aktivoidaksesi TinyUSB-kirjaston ja usb-serial-debugin.
-    //             Voit katsoa apua esimerkistä hello_dual_cdc.
-    //             Lisää CMakeLists.txt-tiedostoon cfg-dual-usbcdc
-    //             Poista CMakeLists.txt-tiedostosta käytöstä pico_enable_stdio_usb
-
+    // Alustetaan stdio (USB, UART) niin että printf toimii.
     stdio_init_all();
 
-    // Uncomment this lines if you want to wait till the serial monitor is connected
-    /*while (!stdio_usb_connected()){
-        sleep_ms(10);
-    }*/ 
-    
-    init_hat_sdk();
-    sleep_ms(300); //Wait some time so initialization of USB and hat is done.
-
-    // Exercise 1: Initialize the button and the led and define an register the corresponding interrupton.
-    //             Interruption handler is defined up as btn_fxn
-    // Tehtävä 1:  Alusta painike ja LEd ja rekisteröi vastaava keskeytys.
-    //             Keskeytyskäsittelijä on määritelty yläpuolella nimellä btn_fxn
-
-
-
-    
-    
-    TaskHandle_t hSensorTask, hPrintTask, hUSB = NULL;
-
-    // Exercise 4: Uncomment this xTaskCreate to create the task that enables dual USB communication.
-    // Tehtävä 4: Poista tämän xTaskCreate-rivin kommentointi luodaksesi tehtävän,
-    // joka mahdollistaa kaksikanavaisen USB-viestinnän.
-
+    // (valinnainen) Odotellaan kunnes sarjamonitori on kiinni.
     /*
-    xTaskCreate(usbTask, "usb", 2048, NULL, 3, &hUSB);
-    #if (configNUMBER_OF_CORES > 1)
-        vTaskCoreAffinitySet(hUSB, 1u << 0);
-    #endif
+    while (!stdio_usb_connected()){
+        sleep_ms(10);
+    }
     */
 
+    // Alustetaan JTKJ Hat -SDK (jos kurssi sitä käyttää)
+    init_hat_sdk();
+    sleep_ms(300); // Odotetaan hetki, että USB ja HAT ovat valmiit.
 
-    // Create the tasks with xTaskCreate
-    BaseType_t result = xTaskCreate(sensor_task, // (en) Task function
-                "sensor",                        // (en) Name of the task 
-                DEFAULT_STACK_SIZE,              // (en) Size of the stack for this task (in words). Generally 1024 or 2048
-                NULL,                            // (en) Arguments of the task 
-                2,                               // (en) Priority of this task
-                &hSensorTask);                   // (en) A handle to control the execution of this task
+    // ===========================
+    // NAPIT
+    // ===========================
+    gpio_init(BUTTON1);
+    gpio_set_dir(BUTTON1, GPIO_IN);
+    gpio_pull_up(BUTTON1);   // oletus = 1, painettaessa = 0
+
+    gpio_init(BUTTON2);
+    gpio_set_dir(BUTTON2, GPIO_IN);
+    gpio_pull_up(BUTTON2);
+
+    // ===========================
+    // I2C + IMU
+    // ===========================
+    // I2C-nopeus: X * 1000 (esim. 400 * 1000 = 400kHz)
+    i2c_init(I2C_PORT, X * 1000);
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_PIN);
+    gpio_pull_up(I2C_SCL_PIN);
+
+    // Kytketään IMU päälle
+    imu_init();
+
+    // ===========================
+    // FreeRTOS-tehtävien luonti
+    // ===========================
+    TaskHandle_t hSensorTask = NULL;
+    TaskHandle_t hPrintTask  = NULL;
+
+    BaseType_t result;
+
+    // Sensoritehtävä (Veikka)
+    result = xTaskCreate(
+                sensor_task,          // tehtäväfunktio
+                "sensor",             // nimi (debugia varten)
+                DEFAULT_STACK_SIZE,   // pinon koko
+                NULL,                 // ei parametreja
+                2,                    // prioriteetti
+                &hSensorTask);        // kahva (voi olla myöhemmin hyödyksi)
 
     if(result != pdPASS) {
         printf("Sensor task creation failed\n");
         return 0;
     }
-    result = xTaskCreate(print_task,  // (en) Task function
-                "print",              // (en) Name of the task 
-                DEFAULT_STACK_SIZE,   // (en) Size of the stack for this task (in words). Generally 1024 or 2048
-                NULL,                 // (en) Arguments of the task 
-                2,                    // (en) Priority of this task
-                &hPrintTask);         // (en) A handle to control the execution of this task
+
+    // Printtaustehtävä (Oona)
+    result = xTaskCreate(
+                print_task,
+                "print",
+                DEFAULT_STACK_SIZE,
+                NULL,
+                2,
+                &hPrintTask);
 
     if(result != pdPASS) {
-        printf("Print Task creation failed\n");
+        printf("Print task creation failed\n");
         return 0;
     }
 
-    // Start the scheduler (never returns)
+    // Käynnistetään FreeRTOSin scheduler (ei palaa koskaan jos kaikki ok)
     vTaskStartScheduler();
-    
-    // Never reach this line.
+
+    // Tänne ei normaalisti koskaan tulla.
     return 0;
 }
-
