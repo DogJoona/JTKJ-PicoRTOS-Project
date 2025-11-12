@@ -40,11 +40,12 @@
 enum state {
     STATE_INIT = 0,      // aloitus / nollaus
     STATE_READ_INPUT,    // luetaan imu + napit
-    STATE_CONVERT,       // (jos joskus erotetaan muunnos omaksi vaiheeksi)
+    STATE_CONVERT,       // (ei käytössä nyt)
     STATE_PRINT          // tulostetaan valmis morse-viesti
 };
 
-enum state programState = STATE_INIT; // aloitetaan INIT-tilasta
+// Aloitetaan suoraan inputin luvusta, pidetään tämä simppelinä
+enum state programState = STATE_READ_INPUT; 
 
 // ===============================
 // GLOBAALIT MUUTTUJAT
@@ -66,6 +67,9 @@ int spaceCount = 0;
 int prevButton1 = 1; // 1 = ei painettuna (pull-up)
 int prevButton2 = 1;
 
+// Viesti valmis -lippu, jota print_task tarkkailee
+volatile int messageReady = 0;
+
 // ===============================
 // PROTOTYYPIT
 // ===============================
@@ -75,27 +79,13 @@ void imu_write_reg(uint8_t reg, uint8_t value);
 uint8_t imu_read_reg(uint8_t reg);
 void imu_init(void);
 
-// Lisää yhden merkin morse-puskuriin, jos mahtuu.
-// Pidetään puskuri aina nollatermitettynä ('\0'), jotta printf toimii helposti.
-static void append_to_morse(char c) {
-    if (morseIndex < MORSE_BUFFER_SIZE - 1) { // -1 jätetään tilaa '\0':lle
-        morseBuffer[morseIndex] = c;
-        morseIndex++;
-        morseBuffer[morseIndex] = '\0';
-    }
-}
-
-// Nollaa viestin (aloitetaan täysin puhtaalta pöydältä).
-static void reset_message(void) {
-    morseIndex = 0;
-    morseBuffer[0] = '\0';
-    spaceCount = 0;
-}
-
-
 // Kulman luku ja muunto piste/viiva-symboliksi
 int read_angle_degrees(void);
 char angle_to_symbol(int angle);
+
+// Puskurin apufunktiot
+void reset_morse(void);
+void add_space_simple(void);
 
 // FreeRTOS-tehtävät
 static void sensor_task(void *arg);
@@ -161,25 +151,37 @@ int read_angle_degrees(void) {
 }
 
 // Muunnetaan kulma morse-symboliksi.
-// HUOM: tätä ei vielä käytetä testissä, mutta runko on valmiina.
-// 0-45 astetta  = '-'
-// 45-90 astetta = '.'
+// 0..2999 = '-' , muuten '.'
 char angle_to_symbol(int angle) {
     if (angle >= 0 && angle < 3000) {
-        return '-'; // vaaka
+        return '-'; // esimerkki: "vaaka"
     } else {
-        return '.'; // pysty
+        return '.'; // esimerkki: "pysty"
     }
 }
 
+// (Jätetään tämä käyttöön jos haluat joskus lisätä suoraan kulmasta puskuriin)
 void angle_to_morse_buffer(int angle) {
-    //Haetaan piste tai viiva kulman perusteella
     char symbol = angle_to_symbol(angle);
-
-    //Varmistetaan, että puskurissa on vielä tilaa
     if (morseIndex < MORSE_BUFFER_SIZE - 2) {
-        morseBuffer[morseIndex] = symbol; //lisätään merkki
-        morseIndex++;
+        morseBuffer[morseIndex++] = symbol;
+        morseBuffer[morseIndex] = '\0';
+    }
+}
+
+// ===============================
+// PUSKURIN APUFUNKTIOT
+// ===============================
+
+void reset_morse(void) {
+    morseIndex = 0;
+    morseBuffer[0] = '\0';
+    spaceCount = 0;
+}
+
+void add_space_simple(void) {
+    if (morseIndex < MORSE_BUFFER_SIZE - 2) {
+        morseBuffer[morseIndex++] = ' ';
         morseBuffer[morseIndex] = '\0';
     }
 }
@@ -189,98 +191,70 @@ void angle_to_morse_buffer(int angle) {
 // ===============================
 
 // sensor_task:
-// - nappi 1 painettaessa: luetaan kulma ja lisätään '.' tai '-' puskuriin
-// - nappi 2 painettaessa: lisätään välilyönti ' '
-// - kun on painettu nappi 2 kolme kertaa peräkkäin -> viesti valmis
+// Lue napit, tee reunantunnistus ja rakenna morseBuffer.
 static void sensor_task(void *arg){
     (void)arg;
 
+    // Alusta edelliset tilat kerran alussa
+    prevButton1 = gpio_get(BUTTON1);
+    prevButton2 = gpio_get(BUTTON2);
+
     for(;;){
-        // 1 = ei painettu (pull-up), 0 = painettu
-        int currentButton1 = gpio_get(BUTTON1);
-        int currentButton2 = gpio_get(BUTTON2);
+        int b1 = gpio_get(BUTTON1); // 0 = painettu
+        int b2 = gpio_get(BUTTON2);
 
-        // ********** NAPPI 1: kirjaa piste/viiva **********
-        // tunnistetaan "uusi painallus": edellinen 1, nyt 0
-        if (prevButton1 == 1 && currentButton1 == 0) {
+        // BUTTON1: lisää piste/viiva kulmasta
+        // Reuna: 1 -> 0 (uusi painallus)
+        if (prevButton1 == 1 && b1 == 0) {
+            printf("BUTTON1 pressed\n");
             int angle = read_angle_degrees();
-
-
             char symbol = angle_to_symbol(angle);
 
-            // lisätään symboli puskuriin
-            append_to_morse(symbol);
-
-            // koska lisättiin merkki, nollataan välilaskuri
-            spaceCount = 0;
-
-            while (gpio_get(BUTTON1) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-    }
-        }
-
-        // ********** NAPPI 2: lisää välilyönti **********
-        if (prevButton2 == 1 && currentButton2 == 0) {
-            // lisätään yksi välilyönti
-            append_to_morse(' ');
-
-            // kasvatetaan peräkkäisten välilyöntien laskuria
-            spaceCount++;
-
-            // jos kolme välilyöntiä peräkkäin -> viesti valmis
-            if (spaceCount == 3) {
-                // korvataan viimeksi lisätty välilyönti rivinvaihdolla
-                // jotta viesti päättyy "  \n"
-                if (morseIndex > 0) {
-                    morseBuffer[morseIndex - 1] = '\n';
-                }
-                // puskuri on jo nollatermitetty append_to_morse:n ansiosta
-
-                // kerrotaan print_taskille, että viesti on valmis
-                programState = STATE_PRINT;
-
-                // valmista, nollataan laskuri seuraavaa viestiä varten
+            if (morseIndex < MORSE_BUFFER_SIZE - 2) {
+                morseBuffer[morseIndex++] = symbol;
+                morseBuffer[morseIndex] = '\0';
+                // Uusi merkki katkaisee välilyöntiketjun
                 spaceCount = 0;
-
-                while (gpio_get(BUTTON2) == 0) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-    }
             }
         }
 
-        // päivitetään "edellinen tila" seuraavaa kierrosta varten
-        prevButton1 = currentButton1;
-        prevButton2 = currentButton2;
+        // BUTTON2: lisää välilyönti, 3 peräkkäistä väliä = viesti valmis
+        if (prevButton2 == 1 && b2 == 0) {
+            printf("BUTTON2 pressed\n");
+            add_space_simple();
+            spaceCount++;
+            if (spaceCount >= 3) {
+                messageReady = 1; // print_task hoitaa tulostuksen ja resetin
+            }
+        }
 
-        // pieni viive, ettei tehtävä juokse liian nopeasti
+        // Päivitä edelliset tilat
+        prevButton1 = b1;
+        prevButton2 = b2;
+
+        // Yksinkertainen debouncaus ja CPU-lepo
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
-
 // print_task:
-// - odottaa STATE_PRINT-tilaa (sensor_task asettaa sen kolmannen välilyönnin jälkeen)
-// - tulostaa morseBufferin
-// - nollaa puskurin ja palaa lukutilaan
+// Näyttää kulman debugina ja tulostaa valmiin morse-viestin kun messageReady=1.
 static void print_task(void *arg){
     (void)arg;
 
     while(1){
-        if (programState == STATE_PRINT) {
-            // Tulosta valmis morse-viesti (sisältää "  \n" lopussa)
-            printf("%s", morseBuffer);
+        int angle = read_angle_degrees();
+        printf("Kulma (raaka): %d\n", angle);
 
-            // Tyhjennä puskuri seuraavaa viestiä varten
-            reset_message();
-
-            // Palataan lukutilaan
-            programState = STATE_READ_INPUT;
+        if (messageReady) {
+            printf(">>> MORSE-VIESTI: %s\n", morseBuffer);
+            reset_morse();
+            messageReady = 0;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(500)); // puoli sekuntia väliä
     }
 }
-
 
 // ===============================
 // PÄÄOHJELMA (main)
@@ -333,21 +307,21 @@ int main() {
 
     BaseType_t result;
 
-    // Sensoritehtävä (Veikka) – vielä tyhjä runko
+    // Sensoritehtävä – lukee napit ja rakentaa viestin
     result = xTaskCreate(
                 sensor_task,          // tehtäväfunktio
                 "sensor",             // nimi (debugia varten)
                 DEFAULT_STACK_SIZE,   // pinon koko
                 NULL,                 // ei parametreja
                 2,                    // prioriteetti
-                &hSensorTask);        // kahva (voi olla myöhemmin hyödyksi)
+                &hSensorTask);        // kahva
 
     if(result != pdPASS) {
         printf("Sensor task creation failed\n");
         return 0;
     }
 
-    // Printtaustehtävä (Oona) – tulostaa kulman
+    // Printtaustehtävä – näyttää kulman ja tulostaa valmiin viestin
     result = xTaskCreate(
                 print_task,
                 "print",
